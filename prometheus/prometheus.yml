@@ -41,7 +41,7 @@ scrape_configs:
       module: [http_via_proxy]
     static_configs:
       - targets:
-          - http://cp.cloudflare.com
+          - http://www.gstatic.com/generate_204
     relabel_configs:
       - source_labels: [__address__]
         target_label: __param_target
@@ -61,7 +61,7 @@ scrape_configs:
       module: [http_via_bridge]
     static_configs:
       - targets:
-          - http://cp.cloudflare.com
+          - http://www.gstatic.com/generate_204
     relabel_configs:
       - source_labels: [__address__]
         target_label: __param_target
