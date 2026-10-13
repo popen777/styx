@@ -264,7 +264,7 @@ def cmd_init(args):
     print("\nReality SNI: сайт с TLS 1.3 + H2, лучше в той же подсети/ASN, что и сервер.")
     print("Подбор: RealiTLScanner по соседним IP (см. deploy/README.md).")
     cfg["exit_reality_sni"] = ask("Reality SNI для US-ноды (например www.example-neighbour.com)")
-    cfg["entry_reality_sni"] = ask("Reality SNI для RU-ноды (домен ИЗ БЕЛОГО СПИСКА, напр. в той же облачной сети)",
+    cfg["entry_reality_sni"] = ask("Reality SNI для RU-ноды (сосед по подсети хостера; для варианта C — домен из белого списка)",
                                    "" if not cfg["entry_ip"] else None, required=bool(cfg["entry_ip"]))
 
     cfg["hop_range"] = ask("Диапазон UDP port hopping", DEFAULTS["hop_range"])
