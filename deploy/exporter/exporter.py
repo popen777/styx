@@ -6,6 +6,7 @@ Metrics:
   styx_up{component}                               1 if the backend answered
   styx_user_online{node,proto,user}                VLESS: distinct online IPs, HY2: client instances
   styx_user_traffic_bytes_total{node,proto,user,direction}
+  styx_awg_last_handshake_seconds{node,user,device}
   styx_outbound_alive{node,tag}                    observatory (entry node only)
   styx_outbound_delay_ms{node,tag}
 """
@@ -13,6 +14,7 @@ Metrics:
 import json
 import os
 import subprocess
+import time
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -22,6 +24,9 @@ XRAY_API = os.environ.get("XRAY_API", "127.0.0.1:10085")
 XRAY_METRICS = os.environ.get("XRAY_METRICS", "http://127.0.0.1:11111/debug/vars")
 HY_STATS = os.environ.get("HY_STATS", "http://127.0.0.1:9998")
 HY_SECRET = os.environ.get("HY_SECRET", "")
+AWG_DUMP = os.environ.get("AWG_DUMP", "")
+AWG_PEERS = os.environ.get("AWG_PEERS", "")
+AWG_ONLINE_WINDOW = 180  # seconds since last handshake (WireGuard re-handshakes every 2 min)
 
 
 def esc(v):
@@ -97,6 +102,40 @@ def collect():
     except Exception as e:
         print(f"hysteria stats: {e}")
         up.append(f"styx_up{labels(node=NODE, component='hysteria')} 0")
+
+    if AWG_DUMP and AWG_PEERS and os.path.exists(AWG_DUMP):
+        try:
+            with open(AWG_PEERS) as f:
+                peers = json.load(f)
+            online, rx_sum, tx_sum = {}, {}, {}
+            hs_lines = ["# TYPE styx_awg_last_handshake_seconds gauge"]
+            now = time.time()
+            with open(AWG_DUMP) as f:
+                for line in f:
+                    parts = line.rstrip("\n").split("\t")
+                    if len(parts) < 4 or parts[0] not in peers:
+                        continue
+                    p = peers[parts[0]]
+                    user, hs = p["user"], as_int(parts[1])
+                    online.setdefault(user, 0)
+                    if hs and now - hs < AWG_ONLINE_WINDOW:
+                        online[user] += 1
+                    rx_sum[user] = rx_sum.get(user, 0) + as_int(parts[2])
+                    tx_sum[user] = tx_sum.get(user, 0) + as_int(parts[3])
+                    hs_lines.append(f"styx_awg_last_handshake_seconds"
+                                    f"{labels(node=NODE, user=user, device=p['device'])} {hs}")
+            for user, n in online.items():
+                lines.append(f"styx_user_online{labels(node=NODE, proto='awg', user=user)} {n}")
+                traffic.append(f"styx_user_traffic_bytes_total"
+                               f"{labels(node=NODE, proto='awg', user=user, direction='up')} {rx_sum[user]}")
+                traffic.append(f"styx_user_traffic_bytes_total"
+                               f"{labels(node=NODE, proto='awg', user=user, direction='down')} {tx_sum[user]}")
+            lines.extend(hs_lines)
+            up.append(f"styx_up{labels(node=NODE, component='amneziawg')} "
+                      f"{1 if now - os.path.getmtime(AWG_DUMP) < 120 else 0}")
+        except Exception as e:
+            print(f"awg dump: {e}")
+            up.append(f"styx_up{labels(node=NODE, component='amneziawg')} 0")
 
     obs = ["# TYPE styx_outbound_alive gauge", "# TYPE styx_outbound_delay_ms gauge"]
     try:

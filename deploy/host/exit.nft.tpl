@@ -22,7 +22,12 @@ table inet styx {
         udp dport 443 accept comment "hysteria2"
         udp dport @@HOP_START@@-@@HOP_END@@ accept comment "hysteria2 port hopping"
         tcp dport @@SUB_PORT@@ accept comment "subscriptions + grafana"
+@@IF_ENTRY@@
         ip saddr @@ENTRY_IP@@ tcp dport @@BRIDGE_PORT@@ accept comment "RU->US xhttp tunnel"
+@@ENDIF_ENTRY@@
+@@IF_AWG@@
+        udp dport @@AWG_PORT@@ accept comment "amneziawg"
+@@ENDIF_AWG@@
     }
 
     chain prerouting {

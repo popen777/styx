@@ -35,6 +35,20 @@
 		header_regexp ua User-Agent (?i)v2raytun
 	}
 	@sub path_regexp tok ^/s/([A-Za-z0-9_-]{16,64})$
+	@awg path_regexp awg ^/s/([A-Za-z0-9_-]{16,64})/([a-z0-9_.-]{1,32})\.conf$
+
+	# AmneziaWG config for a device (router / app): /s/<token>/<device>.conf
+	handle @awg {
+		header {
+			Content-Type "text/plain; charset=utf-8"
+			Content-Disposition "attachment; filename=\"@@AWG_FILE_PREFIX@@-{re.awg.2}.conf\""
+			Cache-Control "no-store"
+			-Server
+		}
+		root * /srv/sub
+		rewrite * /{re.awg.1}.{re.awg.2}.conf
+		file_server
+	}
 
 	handle @happ {
 		import sub_headers

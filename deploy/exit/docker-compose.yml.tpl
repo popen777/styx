@@ -54,6 +54,11 @@ services:
       NODE: exit
       LISTEN: 127.0.0.1:9550
       HY_SECRET: "@@HY_STATS_SECRET@@"
+      AWG_DUMP: /run/styx/awg.dump
+      AWG_PEERS: /etc/styx/awg-peers.json
+    volumes:
+      - /run/styx:/run/styx:ro
+      - ./awg/peers.json:/etc/styx/awg-peers.json:ro
 
   # ---- full-chain probes (clients that use the VPN like a real user)
   probe-xray:
@@ -66,6 +71,7 @@ services:
       - ./probe/xray.json:/etc/xray/config.json:ro
       - ./geo:/usr/local/share/xray:ro
 
+@@IF_ENTRY@@
   probe-hy-entry:
     <<: *base
     image: @@IMG_HYSTERIA@@
@@ -73,6 +79,7 @@ services:
     container_name: styx-probe-hy-entry
     command: ["client", "-c", "/etc/hysteria/config.json"]
     volumes: ["./probe/hy-entry.json:/etc/hysteria/config.json:ro"]
+@@ENDIF_ENTRY@@
 
   probe-hy-exit:
     <<: *base

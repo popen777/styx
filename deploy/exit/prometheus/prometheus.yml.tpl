@@ -29,6 +29,7 @@ scrape_configs:
       - targets: ["127.0.0.1:9550"]
         labels: { node: exit }
 
+@@IF_ENTRY@@
   # ---- RU/entry, scraped THROUGH the VLESS tunnel (probe user → entry's 127.0.0.1).
   # No monitoring port is exposed on the RU server at all.
   - job_name: node-entry
@@ -48,18 +49,21 @@ scrape_configs:
       - target_label: job
         replacement: styx
 
+@@ENDIF_ENTRY@@
   # ---- full-chain probes: client → node → internet, like a real user
   - job_name: chain
     scrape_interval: 30s
     scrape_timeout: 20s
     metrics_path: /probe
     static_configs:
+@@IF_ENTRY@@
       - targets: ["https://www.gstatic.com/generate_204"]
         labels: { module: via_entry_vless, path: "RU-вход VLESS → США → интернет", node: entry, proto: vless }
       - targets: ["https://www.gstatic.com/generate_204"]
         labels: { module: via_entry_hy2, path: "RU-вход Hysteria2 → США → интернет", node: entry, proto: hy2 }
       - targets: ["https://ya.ru/"]
         labels: { module: via_entry_vless_ru, path: "RU-вход VLESS → RU-сайты напрямую", node: entry, proto: vless }
+@@ENDIF_ENTRY@@
       - targets: ["https://www.gstatic.com/generate_204"]
         labels: { module: via_exit_vless, path: "США VLESS → интернет", node: exit, proto: vless }
       - targets: ["https://www.gstatic.com/generate_204"]
@@ -78,8 +82,10 @@ scrape_configs:
   - job_name: reach
     metrics_path: /probe
     static_configs:
+@@IF_ENTRY@@
       - targets: ["@@ENTRY_IP@@:443"]
         labels: { module: tcp, path: "RU TCP 443", node: entry }
+@@ENDIF_ENTRY@@
       - targets: ["@@EXIT_IP@@:443"]
         labels: { module: tcp, path: "US TCP 443", node: exit }
       - targets: ["https://@@SUB_HOST@@:@@SUB_PORT@@/healthz"]

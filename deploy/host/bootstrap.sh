@@ -97,6 +97,20 @@ if [[ -n "$CONTROL_PUBKEY" ]]; then
     grep -qF "$CONTROL_PUBKEY" /root/.ssh/authorized_keys || echo "$CONTROL_PUBKEY" >> /root/.ssh/authorized_keys
 fi
 
+if [[ "$ROLE" == "exit" && "${SKIP_AWG:-0}" != "1" ]]; then
+    info "AmneziaWG (ядерный модуль через DKMS, ppa:amnezia/ppa)"
+    if apt-get install -y -qq software-properties-common "linux-headers-$(uname -r)" >/dev/null 2>&1 \
+        && add-apt-repository -y ppa:amnezia/ppa >/dev/null 2>&1 \
+        && apt-get update -qq && apt-get install -y -qq amneziawg >/dev/null 2>&1 \
+        && modprobe amneziawg; then
+        echo amneziawg >> /etc/modules-load.d/styx.conf
+        info "AmneziaWG установлен: $(awg --version 2>/dev/null | head -1)"
+    else
+        warn "AmneziaWG не установился (нет headers для ядра хостера?). VLESS/Hysteria это не затрагивает. "
+        warn "Решение: поставь стандартное ядро Ubuntu (linux-generic) и перезапусти bootstrap"
+    fi
+fi
+
 if [[ "$ROLE" == "exit" ]]; then
     REPO_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
     info "таймеры: ежедневное обновление geo-баз и сертификата на RU-ноде"

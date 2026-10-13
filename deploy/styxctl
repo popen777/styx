@@ -58,6 +58,11 @@ DEFAULTS = {
     "mtproto_enabled": False,
     "mtproto_port": 8444,
     "mtproto_domain": "",
+    "awg_enabled": False,
+    "awg_port": 52820,
+    "awg_subnet": "10.66.66",
+    "awg_dns": "1.1.1.1, 8.8.8.8",
+    "awg_mtu": 1280,
     "images": {
         "xray": "ghcr.io/xtls/xray-core:26.9.9",
         "hysteria": "tobyxdd/hysteria:v2.12.3",
@@ -198,13 +203,30 @@ def detect_public_ip():
 
 
 def tpl(text, values):
-    """Replace @@KEY@@ tokens; fail loudly on leftovers."""
+    """Replace @@KEY@@ tokens; fail loudly on leftovers.
+
+    Blocks between @@IF_X@@ and @@ENDIF_X@@ are kept only when values["IF_X"] is true.
+    """
+    def cond(m):
+        return m.group(2) if values.get(f"IF_{m.group(1)}") else ""
+    text = re.sub(r"[ \t]*@@IF_([A-Z0-9_]+)@@\n?(.*?)[ \t]*@@ENDIF_\1@@\n?", cond, text, flags=re.S)
     for k, v in values.items():
+        if k.startswith("IF_"):
+            continue
         text = text.replace(f"@@{k}@@", str(v))
     left = re.findall(r"@@[A-Z0-9_]+@@", text)
     if left:
         die(f"unrendered template tokens: {sorted(set(left))}")
     return text
+
+
+def has_entry(cfg):
+    return bool(cfg.get("entry_ip"))
+
+
+def need_entry(cfg, what):
+    if not has_entry(cfg):
+        die(f"{what}: нужна RU-нода (entry_ip в state/config.json пустой)")
 
 
 def sanitize_name(name):
@@ -234,14 +256,16 @@ def cmd_init(args):
 
     cfg["exit_ip"] = ask("Публичный IPv4 US-ноды (exit)", detect_public_ip())
     cfg["exit_ssh_port"] = int(ask("SSH-порт US-ноды", DEFAULTS["exit_ssh_port"]))
-    cfg["entry_ip"] = ask("Публичный IPv4 RU-ноды (entry, белый список)")
-    cfg["entry_ssh_port"] = int(ask("SSH-порт RU-ноды", DEFAULTS["entry_ssh_port"]))
-    cfg["entry_ssh_user"] = ask("SSH-пользователь RU-ноды", DEFAULTS["entry_ssh_user"])
+    cfg["entry_ip"] = ask("Публичный IPv4 RU-ноды (Enter — пока без неё, только США)", "", required=False)
+    if cfg["entry_ip"]:
+        cfg["entry_ssh_port"] = int(ask("SSH-порт RU-ноды", DEFAULTS["entry_ssh_port"]))
+        cfg["entry_ssh_user"] = ask("SSH-пользователь RU-ноды", DEFAULTS["entry_ssh_user"])
 
     print("\nReality SNI: сайт с TLS 1.3 + H2, лучше в той же подсети/ASN, что и сервер.")
     print("Подбор: RealiTLScanner по соседним IP (см. deploy/README.md).")
     cfg["exit_reality_sni"] = ask("Reality SNI для US-ноды (например www.example-neighbour.com)")
-    cfg["entry_reality_sni"] = ask("Reality SNI для RU-ноды (домен ИЗ БЕЛОГО СПИСКА, напр. в той же облачной сети)")
+    cfg["entry_reality_sni"] = ask("Reality SNI для RU-ноды (домен ИЗ БЕЛОГО СПИСКА, напр. в той же облачной сети)",
+                                   "" if not cfg["entry_ip"] else None, required=bool(cfg["entry_ip"]))
 
     cfg["hop_range"] = ask("Диапазон UDP port hopping", DEFAULTS["hop_range"])
     cfg["bridge_port"] = int(ask("TCP-порт межсерверного туннеля XHTTP (открыт только для RU IP)",
@@ -253,7 +277,7 @@ def cmd_init(args):
     cfg["deadman_url"] = ask("Dead man's switch URL (healthchecks.io, Enter — пропустить)",
                              "", required=False)
 
-    mt = ask("Включить MTProto-прокси для Telegram на RU-ноде? (y/N)", "n", required=False)
+    mt = ask("Включить MTProto-прокси для Telegram на RU-ноде? (y/N)", "n", required=False) if cfg["entry_ip"] else "n"
     cfg["mtproto_enabled"] = mt.lower().startswith("y")
     if cfg["mtproto_enabled"]:
         cfg["mtproto_port"] = int(ask("Порт MTProto", DEFAULTS["mtproto_port"]))
@@ -296,8 +320,8 @@ def cmd_init(args):
 
     info("Готово. state/config.json создан (держи его в секрете и делай бэкап).")
     print("\nДальше:")
-    print("  1) На RU-ноде добавь ключ управления в /root/.ssh/authorized_keys:\n")
-    print(f"     {pub}\n")
+    print("  1) На RU-ноде (когда появится) выполни bootstrap с ключом управления:\n")
+    print(f"     sudo bash bootstrap.sh entry \"{pub}\"\n")
     print("  2) ./styxctl geo-update")
     print("  3) ./styxctl user add <имя>")
     print("  4) ./styxctl deploy")
@@ -371,6 +395,9 @@ def cmd_user_rotate(args):
     u["uuid"] = str(uuid.uuid4())
     u["hy_password"] = password()
     u["token"] = secrets.token_urlsafe(18)
+    for d in u.get("awg", []):
+        d["private"], d["public"] = wg_keypair()
+        d["psk"] = base64.b64encode(secrets.token_bytes(32)).decode()
     save_users(users)
     if not args.no_deploy:
         deploy(cfg, users)
@@ -410,6 +437,10 @@ def show_user(cfg, user):
     print("Отдельные ссылки:")
     for line in client_links(cfg, user):
         print(f"  {line}")
+    if cfg["awg_enabled"] and user.get("awg"):
+        print("\nAmneziaWG (роутеры / приложения):")
+        for d in user["awg"]:
+            print(f"  {d['device']:<14} {url}/{d['device']}.conf")
     print()
 
 
@@ -438,12 +469,16 @@ def hy2_link(user, pw, host, sni, obfs, hop, name):
 def client_links(cfg, user):
     s = cfg["secrets"]
     fp = cfg["fingerprint"]
-    return [
-        vless_link(user["uuid"], cfg["entry_ip"], 443, s["entry_reality_public"],
-                   cfg["entry_reality_sni"], s["entry_short_id"], fp,
-                   "🇷🇺→🇺🇸 RU-вход · VLESS (белые списки)"),
-        hy2_link(user["name"], user["hy_password"], cfg["entry_ip"], cfg["hy_host"],
-                 s["entry_obfs"], cfg["hop_range"], "🇷🇺→🇺🇸 RU-вход · Hysteria2"),
+    links = []
+    if has_entry(cfg):
+        links += [
+            vless_link(user["uuid"], cfg["entry_ip"], 443, s["entry_reality_public"],
+                       cfg["entry_reality_sni"], s["entry_short_id"], fp,
+                       "🇷🇺→🇺🇸 RU-вход · VLESS (белые списки)"),
+            hy2_link(user["name"], user["hy_password"], cfg["entry_ip"], cfg["hy_host"],
+                     s["entry_obfs"], cfg["hop_range"], "🇷🇺→🇺🇸 RU-вход · Hysteria2"),
+        ]
+    return links + [
         vless_link(user["uuid"], cfg["exit_ip"], 443, s["exit_reality_public"],
                    cfg["exit_reality_sni"], s["exit_short_id"], fp,
                    "🇺🇸 США напрямую · VLESS"),
@@ -654,23 +689,19 @@ def probe_xray(cfg):
                                                    "publicKey": pbk, "shortId": sid}},
         }
 
-    return {
+    conf = {
         "log": {"loglevel": "warning"},
-        "inbounds": [
-            {"tag": "via-entry", "listen": "127.0.0.1", "port": 18081, "protocol": "http"},
-            {"tag": "via-exit", "listen": "127.0.0.1", "port": 18082, "protocol": "http"},
-        ],
-        "outbounds": [
-            out("entry", cfg["entry_ip"], s["entry_reality_public"], cfg["entry_reality_sni"],
-                s["entry_short_id"]),
-            out("exit", cfg["exit_ip"], s["exit_reality_public"], cfg["exit_reality_sni"],
-                s["exit_short_id"]),
-        ],
-        "routing": {"rules": [
-            {"type": "field", "inboundTag": ["via-entry"], "outboundTag": "entry"},
-            {"type": "field", "inboundTag": ["via-exit"], "outboundTag": "exit"},
-        ]},
+        "inbounds": [{"tag": "via-exit", "listen": "127.0.0.1", "port": 18082, "protocol": "http"}],
+        "outbounds": [out("exit", cfg["exit_ip"], s["exit_reality_public"], cfg["exit_reality_sni"],
+                          s["exit_short_id"])],
+        "routing": {"rules": [{"type": "field", "inboundTag": ["via-exit"], "outboundTag": "exit"}]},
     }
+    if has_entry(cfg):
+        conf["inbounds"].append({"tag": "via-entry", "listen": "127.0.0.1", "port": 18081, "protocol": "http"})
+        conf["outbounds"].append(out("entry", cfg["entry_ip"], s["entry_reality_public"],
+                                     cfg["entry_reality_sni"], s["entry_short_id"]))
+        conf["routing"]["rules"].append({"type": "field", "inboundTag": ["via-entry"], "outboundTag": "entry"})
+    return conf
 
 
 # ---------------------------------------------------------------- hysteria configs
@@ -796,6 +827,10 @@ def tpl_values(cfg):
         "IMG_PROMETHEUS": im["prometheus"], "IMG_ALERTMANAGER": im["alertmanager"],
         "IMG_BLACKBOX": im["blackbox"], "IMG_NODE_EXPORTER": im["node_exporter"],
         "IMG_GRAFANA": im["grafana"], "IMG_MTG": im["mtg"],
+        "IF_ENTRY": has_entry(cfg),
+        "IF_AWG": cfg["awg_enabled"],
+        "AWG_PORT": cfg["awg_port"],
+        "AWG_FILE_PREFIX": re.sub(r"[^A-Za-z0-9_-]", "", cfg["server_name"]) or "vpn",
     }
 
 
@@ -835,15 +870,20 @@ def render(cfg, users):
                     {"probe": s["probe_hy_password"], "bridge": s["bridge_hy_password"]},
                     cert, key, socks_outbound=False), 0o600)
     write(ex / "probe" / "xray.json", probe_xray(cfg))
-    write(ex / "probe" / "hy-entry.json",
-          hy_client(cfg, f"{cfg['entry_ip']}:443", f"probe:{s['probe_hy_password']}",
-                    s["entry_obfs"], "http", "127.0.0.1:18083"), 0o600)
+    if has_entry(cfg):
+        write(ex / "probe" / "hy-entry.json",
+              hy_client(cfg, f"{cfg['entry_ip']}:443", f"probe:{s['probe_hy_password']}",
+                        s["entry_obfs"], "http", "127.0.0.1:18083"), 0o600)
     write(ex / "probe" / "hy-exit.json",
           hy_client(cfg, f"{cfg['exit_ip']}:443", f"probe:{s['probe_hy_password']}",
                     s["exit_obfs"], "http", "127.0.0.1:18084"), 0o600)
     (ex / "sub").mkdir(parents=True, exist_ok=True)
     render_subscriptions(cfg, users, ex / "sub")
     copy_geo(ex / "geo")
+    render_awg(cfg, users, ex)
+
+    if not has_entry(cfg):
+        return tmp
 
     # ---- entry
     en = tmp / "entry"
@@ -894,10 +934,14 @@ def changed_services(node, old, new):
     return changed, services
 
 
+def nodes(cfg):
+    return ("exit", "entry") if has_entry(cfg) else ("exit",)
+
+
 def cmd_render(args):
     cfg = load_config()
     tmp = render(cfg, load_users())
-    for node in ("exit", "entry"):
+    for node in nodes(cfg):
         dst = BUILD / node
         shutil.rmtree(dst, ignore_errors=True)
         dst.parent.mkdir(parents=True, exist_ok=True)
@@ -973,11 +1017,12 @@ def deploy(cfg, users, only=None):
     tmp = render(cfg, users)
     try:
         xray_test(cfg, tmp / "exit" / "xray" / "config.json", tmp / "exit" / "geo")
-        xray_test(cfg, tmp / "entry" / "xray" / "config.json", tmp / "entry" / "geo")
         xray_test(cfg, tmp / "exit" / "probe" / "xray.json", tmp / "exit" / "geo")
+        if has_entry(cfg):
+            xray_test(cfg, tmp / "entry" / "xray" / "config.json", tmp / "entry" / "geo")
         info("xray -test: все конфиги валидны")
 
-        for node in ("exit", "entry"):
+        for node in nodes(cfg):
             new_hashes = tree_hashes(tmp / node)
             old_hashes = load_json(manifest_path(node), {})
             dst = BUILD / node
@@ -1002,6 +1047,9 @@ def deploy_exit(cfg, node_dir, changed, services):
     if any(f.startswith("host/") for f in changed):
         apply_host_local(node_dir)
         info("US/exit: sysctl и firewall применены")
+    if cfg["awg_enabled"] and any(f.startswith("awg/") for f in changed):
+        apply_awg_local(node_dir)
+        info("US/exit: AmneziaWG применён (без разрыва активных сессий)")
     CADDY_DATA.mkdir(parents=True, exist_ok=True)
     compose(node_dir, "up", "-d", "--build", "--remove-orphans")
     if services:
@@ -1041,6 +1089,8 @@ def cmd_deploy(args):
 def cmd_sync_certs(args):
     """Copy the renewed hy-host certificate to the entry node (Hysteria re-reads it per handshake)."""
     cfg = load_config()
+    if not has_entry(cfg):
+        return
     cert, key = wait_for_cert(cfg, timeout=1)
     if not cert:
         die("сертификат не найден в state/caddy")
@@ -1070,6 +1120,235 @@ def cmd_geo_update(args):
         deploy(load_config(), load_users())
 
 
+# ---------------------------------------------------------------- amneziawg
+
+AWG_CONF = Path("/etc/amnezia/amneziawg/awg0.conf")
+
+
+def wg_keypair():
+    """WireGuard keys are plain X25519 in standard base64."""
+    priv_der = run(["openssl", "genpkey", "-algorithm", "X25519", "-outform", "DER"],
+                   capture=True).stdout
+    pub_der = run(["openssl", "pkey", "-inform", "DER", "-pubout", "-outform", "DER"],
+                  capture=True, input_bytes=priv_der).stdout
+    return base64.b64encode(priv_der[-32:]).decode(), base64.b64encode(pub_der[-32:]).decode()
+
+
+def awg_obfs_params():
+    """AmneziaWG 1.x junk/header params (compatible with Keenetic, OpenWrt, Amnezia apps)."""
+    r = secrets.SystemRandom()
+    s1 = r.randint(15, 150)
+    s2 = r.randint(15, 150)
+    while s1 + 56 == s2:
+        s2 = r.randint(15, 150)
+    headers = set()
+    while len(headers) < 4:
+        headers.add(r.randint(5, 2**31 - 1))
+    h = sorted(headers)
+    r.shuffle(h)
+    return {"Jc": r.randint(4, 8), "Jmin": 40, "Jmax": 70, "S1": s1, "S2": s2,
+            "H1": h[0], "H2": h[1], "H3": h[2], "H4": h[3]}
+
+
+def awg_devices(users):
+    for u in users:
+        for d in u.get("awg", []):
+            yield u, d
+
+
+def awg_next_ip(cfg, users):
+    used = {d["ip"] for _, d in awg_devices(users)}
+    for i in range(2, 255):
+        ip = f"{cfg['awg_subnet']}.{i}"
+        if ip not in used:
+            return ip
+    die("закончились адреса в подсети AmneziaWG")
+
+
+def awg_params_block(p):
+    return "\n".join(f"{k} = {p[k]}" for k in ("Jc", "Jmin", "Jmax", "S1", "S2", "H1", "H2", "H3", "H4"))
+
+
+def awg_server_conf(cfg, users):
+    s = cfg["secrets"]
+    net = f"{cfg['awg_subnet']}.0/24"
+    private = "10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,100.64.0.0/10,169.254.0.0/16"
+    up = [
+        "iptables -I FORWARD 1 -i %i -j ACCEPT",
+        "iptables -I FORWARD 1 -o %i -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT",
+        f"iptables -I FORWARD 1 -i %i -d {private} -j DROP",
+        f"iptables -t nat -A POSTROUTING -s {net} ! -o %i -j MASQUERADE",
+        "iptables -t mangle -A FORWARD -o %i -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu",
+        "iptables -t mangle -A FORWARD -i %i -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu",
+    ]
+    down = [c.replace(" -I FORWARD 1 ", " -D FORWARD ").replace(" -A ", " -D ") for c in up]
+    lines = [
+        "# Styx 2 — AmneziaWG server (rendered by styxctl, applied with awg syncconf)",
+        "[Interface]",
+        f"PrivateKey = {s['awg_server_private']}",
+        f"Address = {cfg['awg_subnet']}.1/24",
+        f"ListenPort = {cfg['awg_port']}",
+        awg_params_block(s["awg_params"]),
+        "PostUp = " + "; ".join(up),
+        "PostDown = " + "; ".join(down),
+    ]
+    for u, d in awg_devices(users):
+        if not u["enabled"]:
+            continue
+        lines += ["", f"# {u['name']} / {d['device']}", "[Peer]",
+                  f"PublicKey = {d['public']}", f"PresharedKey = {d['psk']}",
+                  f"AllowedIPs = {d['ip']}/32"]
+    return "\n".join(lines) + "\n"
+
+
+def awg_client_conf(cfg, user, dev):
+    s = cfg["secrets"]
+    return "\n".join([
+        f"# {cfg['server_name']} — {user['name']} / {dev['device']}",
+        "[Interface]",
+        f"PrivateKey = {dev['private']}",
+        f"Address = {dev['ip']}/32",
+        f"DNS = {cfg['awg_dns']}",
+        f"MTU = {cfg['awg_mtu']}",
+        awg_params_block(s["awg_params"]),
+        "",
+        "[Peer]",
+        f"PublicKey = {s['awg_server_public']}",
+        f"PresharedKey = {dev['psk']}",
+        f"Endpoint = {cfg['exit_ip']}:{cfg['awg_port']}",
+        "AllowedIPs = 0.0.0.0/0, ::/0",
+        "PersistentKeepalive = 25",
+    ]) + "\n"
+
+
+def render_awg(cfg, users, ex):
+    peers = {}
+    if cfg["awg_enabled"]:
+        write(ex / "awg" / "awg0.conf", awg_server_conf(cfg, users), 0o600)
+        for u, d in awg_devices(users):
+            if not u["enabled"]:
+                continue
+            peers[d["public"]] = {"user": u["name"], "device": d["device"]}
+            write(ex / "sub" / f"{u['token']}.{d['device']}.conf", awg_client_conf(cfg, u, d))
+    write(ex / "awg" / "peers.json", peers)
+
+
+def apply_awg_local(node_dir):
+    if not shutil.which("awg"):
+        die("awg не установлен — перезапусти bootstrap.sh exit (ставит amneziawg из ppa:amnezia/ppa)")
+    AWG_CONF.parent.mkdir(parents=True, exist_ok=True)
+    run(["install", "-m", "600", str(node_dir / "awg" / "awg0.conf"), str(AWG_CONF)])
+    if run(["ip", "link", "show", "awg0"], check=False, capture=True).returncode == 0:
+        run(["bash", "-c", "awg syncconf awg0 <(awg-quick strip awg0)"])
+    else:
+        run(["systemctl", "enable", "--now", "awg-quick@awg0"])
+    Path("/run/styx").mkdir(parents=True, exist_ok=True)
+    write(Path("/etc/systemd/system/styx-awg-dump.service"),
+          "[Unit]\nDescription=Styx AmneziaWG stats dump\n\n[Service]\nType=oneshot\n"
+          # keep only: peer pubkey, latest handshake, rx, tx (no private keys / PSKs / client IPs)
+          "ExecStart=/bin/sh -c 'mkdir -p /run/styx && awg show awg0 dump | tail -n +2 | cut -f1,5,6,7 "
+          "> /run/styx/awg.dump.tmp && mv /run/styx/awg.dump.tmp /run/styx/awg.dump'\n")
+    write(Path("/etc/systemd/system/styx-awg-dump.timer"),
+          "[Unit]\nDescription=Styx AmneziaWG stats dump\n\n[Timer]\nOnBootSec=30s\n"
+          "OnUnitActiveSec=20s\nAccuracySec=1s\n\n[Install]\nWantedBy=timers.target\n")
+    run(["systemctl", "daemon-reload"])
+    run(["systemctl", "enable", "--now", "styx-awg-dump.timer"])
+
+
+def awg_ensure_enabled(cfg):
+    if not cfg["awg_enabled"]:
+        die("AmneziaWG выключен — сначала: ./styxctl awg enable")
+
+
+def cmd_awg(args):
+    raw = load_json(CONFIG_FILE)
+    if raw is None:
+        die("state/config.json not found — run: ./styxctl init")
+    users = load_users()
+
+    if args.action == "enable":
+        raw["awg_enabled"] = True
+        if args.port:
+            raw["awg_port"] = args.port
+        sec = raw["secrets"]
+        if not sec.get("awg_server_private"):
+            sec["awg_server_private"], sec["awg_server_public"] = wg_keypair()
+            sec["awg_params"] = awg_obfs_params()
+        save_json(CONFIG_FILE, raw)
+        info("AmneziaWG включён")
+        cfg = load_config()
+        hop_start, hop_end = map(int, cfg["hop_range"].split("-"))
+        if hop_start <= cfg["awg_port"] <= hop_end or cfg["awg_port"] in (443, cfg["sub_port"]):
+            die(f"порт {cfg['awg_port']} пересекается с 443/подписками/port hopping — выбери другой (--port)")
+        if not args.no_deploy:
+            deploy(cfg, users)
+        return
+
+    if args.action == "disable":
+        raw["awg_enabled"] = False
+        save_json(CONFIG_FILE, raw)
+        if not args.no_deploy:
+            run(["systemctl", "disable", "--now", "awg-quick@awg0"], check=False)
+            run(["systemctl", "disable", "--now", "styx-awg-dump.timer"], check=False)
+            deploy(load_config(), users)
+        info("AmneziaWG выключен")
+        return
+
+    cfg = load_config()
+    awg_ensure_enabled(cfg)
+
+    if args.action == "list":
+        print(f"{'пользователь':<20} {'устройство':<16} {'IP':<15}")
+        for u, d in awg_devices(users):
+            print(f"{u['name']:<20} {d['device']:<16} {d['ip']:<15}")
+        return
+
+    if not args.user:
+        die("укажи пользователя")
+    user = find_user(users, args.user)
+    device = sanitize_name(args.device or "router")
+
+    if args.action == "add":
+        if any(d["device"] == device for d in user.get("awg", [])):
+            die(f"у '{user['name']}' уже есть устройство '{device}'")
+        priv, pub = wg_keypair()
+        user.setdefault("awg", []).append({
+            "device": device, "private": priv, "public": pub,
+            "psk": base64.b64encode(secrets.token_bytes(32)).decode(),
+            "ip": awg_next_ip(cfg, users),
+        })
+        save_users(users)
+        info(f"AmneziaWG: {user['name']} / {device} добавлен")
+        if not args.no_deploy:
+            deploy(cfg, users)
+        show_awg(cfg, user, device)
+    elif args.action == "del":
+        before = len(user.get("awg", []))
+        user["awg"] = [d for d in user.get("awg", []) if d["device"] != device]
+        if len(user["awg"]) == before:
+            die(f"у '{user['name']}' нет устройства '{device}'")
+        save_users(users)
+        info(f"AmneziaWG: {user['name']} / {device} удалён")
+        if not args.no_deploy:
+            deploy(cfg, users)
+    elif args.action == "show":
+        show_awg(cfg, user, device)
+
+
+def show_awg(cfg, user, device):
+    dev = next((d for d in user.get("awg", []) if d["device"] == device), None)
+    if not dev:
+        die(f"у '{user['name']}' нет устройства '{device}' (./styxctl awg add {user['name']} {device})")
+    conf = awg_client_conf(cfg, user, dev)
+    url = f"{sub_url(cfg, user)}/{device}.conf"
+    print(f"\n=== AmneziaWG: {user['name']} / {device} ===\n")
+    print(f"Скачать конфиг (роутер / приложение):\n\n  {url}\n")
+    print(conf)
+    if shutil.which("qrencode"):
+        print("QR для AmneziaVPN / AmneziaWG:")
+        subprocess.run(["qrencode", "-t", "ANSIUTF8", "-m", "1"], input=conf.encode())
+
+
 # ---------------------------------------------------------------- mtproto
 
 def mtproto_link(cfg):
@@ -1082,6 +1361,7 @@ def cmd_mtproto(args):
     if raw is None:
         die("state/config.json not found — run: ./styxctl init")
     if args.action == "enable":
+        need_entry(raw, "MTProto")
         domain = args.domain or raw.get("mtproto_domain") or raw["entry_reality_sni"]
         raw["mtproto_enabled"] = True
         raw["mtproto_domain"] = domain
@@ -1133,22 +1413,22 @@ def cmd_status(args):
     except Exception as e:
         die(f"Prometheus недоступен на 127.0.0.1:9090: {e}")
 
-    cols = [("entry", "vless"), ("entry", "hy2"), ("exit", "vless"), ("exit", "hy2")]
+    cols = [("entry", "vless"), ("entry", "hy2"), ("exit", "vless"), ("exit", "hy2"), ("exit", "awg")]
     table = {u["name"]: {c: 0 for c in cols} for u in users}
     for r in online:
         m = r["metric"]
         table.setdefault(m["user"], {c: 0 for c in cols})[(m["node"], m["proto"])] = int(float(r["value"][1]))
     tr = {r["metric"]["user"]: float(r["value"][1]) for r in traffic}
 
-    print("\nУстройства онлайн (VLESS = уникальные IP, HY2 = клиенты):\n")
-    print(f"{'пользователь':<20} {'RU·VLESS':>9} {'RU·HY2':>8} {'US·VLESS':>9} {'US·HY2':>8} {'24ч':>11}")
+    print("\nУстройства онлайн (VLESS = уникальные IP, HY2 = клиенты, AWG = пиры с handshake < 3 мин):\n")
+    print(f"{'пользователь':<20} {'RU·VLESS':>9} {'RU·HY2':>8} {'US·VLESS':>9} {'US·HY2':>8} {'AWG':>5} {'24ч':>11}")
     total = 0
     for name in sorted(table):
         row = table[name]
         s = sum(row.values())
         total += s
         mark = "●" if s else " "
-        print(f"{mark} {name:<18} " + " ".join(f"{row[c]:>{w}}" for c, w in zip(cols, (9, 8, 9, 8)))
+        print(f"{mark} {name:<18} " + " ".join(f"{row[c]:>{w}}" for c, w in zip(cols, (9, 8, 9, 8, 5)))
               + f" {human(tr.get(name, 0)):>11}")
     active = sum(1 for r in table.values() if sum(r.values()))
     print(f"\nактивных пользователей: {active} / {len(users)}, устройств: {total}")
@@ -1203,6 +1483,14 @@ def main():
     sp.add_argument("--port", type=int)
     sp.add_argument("--no-deploy", action="store_true")
     sp.set_defaults(func=cmd_mtproto)
+
+    sp = sub.add_parser("awg", help="AmneziaWG: конфиги для роутеров и приложений")
+    sp.add_argument("action", choices=["enable", "disable", "add", "del", "show", "list"])
+    sp.add_argument("user", nargs="?")
+    sp.add_argument("device", nargs="?", help="имя устройства: router, laptop, ... (по умолчанию router)")
+    sp.add_argument("--port", type=int)
+    sp.add_argument("--no-deploy", action="store_true")
+    sp.set_defaults(func=cmd_awg)
 
     sp = sub.add_parser("render", help="только отрендерить конфиги в build/")
     sp.set_defaults(func=cmd_render)
