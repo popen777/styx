@@ -1,0 +1,116 @@
+# Styx 2 — alert rules
+groups:
+  - name: styx-chains
+    rules:
+      - alert: ChainDown
+        expr: probe_success{job="chain"} == 0
+        for: 3m
+        labels: { severity: critical }
+        annotations:
+          summary: "Не работает: {{ $labels.path }}"
+          description: "Проба через реальный клиент падает 3+ минуты."
+
+      - alert: RuEntryFullyDown
+        expr: max(probe_success{job="chain", node="entry"}) == 0
+        for: 2m
+        labels: { severity: critical }
+        annotations:
+          summary: "RU-вход полностью недоступен (VLESS и Hysteria2)"
+          description: "Клиентам — переключиться на профиль «США напрямую»."
+
+      - alert: NodeUnreachable
+        expr: probe_success{job="reach", module="tcp"} == 0
+        for: 2m
+        labels: { severity: critical }
+        annotations:
+          summary: "{{ $labels.path }}: порт не отвечает"
+
+      - alert: EntryMetricsMissing
+        expr: up{job=~"node-entry|styx-entry"} == 0
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "Нет метрик с RU-ноды (туннель мониторинга не работает)"
+
+  - name: styx-links
+    rules:
+      - alert: RuUsLinkDown
+        expr: styx_outbound_alive{node="entry"} == 0
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "Канал RU→US {{ $labels.tag }} мёртв (трафик ушёл на резервный)"
+
+      - alert: RuUsAllLinksDown
+        expr: max(styx_outbound_alive{node="entry"}) == 0
+        for: 2m
+        labels: { severity: critical }
+        annotations:
+          summary: "Все каналы RU→US мертвы — RU-вход не выпускает в интернет"
+
+      - alert: RuUsHighLatency
+        expr: min(styx_outbound_delay_ms{node="entry"} > 0) > 600
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "Задержка RU→US {{ $value }} мс (лучший канал)"
+
+      - alert: BackendDown
+        expr: styx_up == 0
+        for: 2m
+        labels: { severity: critical }
+        annotations:
+          summary: "{{ $labels.component }} на {{ $labels.node }} не отвечает"
+
+  - name: styx-system
+    rules:
+      - alert: HighCPU
+        expr: 100 - avg by (node) (rate(node_cpu_seconds_total{mode="idle"}[5m])) * 100 > 85
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "CPU {{ $labels.node }}: {{ $value | printf \"%.0f\" }}%"
+
+      - alert: HighMemory
+        expr: (1 - node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes) * 100 > 90
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "RAM {{ $labels.node }}: {{ $value | printf \"%.0f\" }}%"
+
+      - alert: DiskSpaceLow
+        expr: (1 - node_filesystem_avail_bytes{fstype!~"tmpfs|overlay"} / node_filesystem_size_bytes{fstype!~"tmpfs|overlay"}) * 100 > 85
+        for: 10m
+        labels: { severity: critical }
+        annotations:
+          summary: "Диск {{ $labels.node }} {{ $labels.mountpoint }}: {{ $value | printf \"%.0f\" }}%"
+
+      - alert: ConntrackNearlyFull
+        expr: node_nf_conntrack_entries / node_nf_conntrack_entries_limit > 0.8
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "conntrack на {{ $labels.node }} заполнен на 80%+"
+
+      - alert: CertExpiringSoon
+        expr: probe_ssl_earliest_cert_expiry{job="reach"} - time() < 14 * 86400
+        for: 1h
+        labels: { severity: warning }
+        annotations:
+          summary: "Сертификат {{ $labels.target }} истекает через {{ $value | humanizeDuration }}"
+
+      - alert: NodeRebooted
+        expr: time() - node_boot_time_seconds < 600
+        labels: { severity: info }
+        annotations:
+          summary: "{{ $labels.node }} перезагрузился"
+
+  - name: styx-meta
+    rules:
+      # Always firing. Alertmanager pings the dead man's switch with it; if the
+      # US node (and therefore monitoring) dies, the pings stop and you get an alert.
+      - alert: Watchdog
+        expr: vector(1)
+        labels: { severity: none }
+        annotations:
+          summary: "Мониторинг жив"

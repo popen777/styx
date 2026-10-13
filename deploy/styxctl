@@ -1,0 +1,1225 @@
+#!/usr/bin/env python3
+"""styxctl — control tool for Styx 2 (RU entry + US exit).
+
+Runs on the exit (US) node, which is the control node: it keeps the state
+(secrets + users), renders configs for both nodes, builds per-user
+subscriptions, deploys locally and to the entry node over SSH.
+
+Only the Python standard library, openssl, ssh, rsync and docker are used.
+"""
+
+import argparse
+import base64
+import datetime
+import hashlib
+import json
+import os
+import re
+import secrets
+import shutil
+import subprocess
+import sys
+import tempfile
+import urllib.parse
+import urllib.request
+import uuid
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent
+STATE = ROOT / "state"
+BUILD = ROOT / "build"
+CONFIG_FILE = STATE / "config.json"
+USERS_FILE = STATE / "users.json"
+SSH_KEY = STATE / "ssh" / "id_ed25519"
+GEO_DIR = STATE / "geo"
+CADDY_DATA = STATE / "caddy"
+
+ENTRY_REMOTE_DIR = "/opt/styx"
+
+SYSTEM_USERS = ("probe", "bridge")
+
+GEO_URLS = {
+    "geoip.dat": "https://raw.githubusercontent.com/runetfreedom/russia-v2ray-rules-dat/release/geoip.dat",
+    "geosite.dat": "https://raw.githubusercontent.com/runetfreedom/russia-v2ray-rules-dat/release/geosite.dat",
+}
+
+DEFAULTS = {
+    "server_name": "Styx",
+    "sub_port": 2096,
+    "bridge_port": 8443,
+    "hop_range": "20000-50000",
+    "exit_ssh_port": 22,
+    "entry_ssh_port": 22,
+    "entry_ssh_user": "root",
+    "fingerprint": "chrome",
+    "hy_bandwidth_up": "",
+    "hy_bandwidth_down": "",
+    "deadman_url": "",
+    "mtproto_enabled": False,
+    "mtproto_port": 8444,
+    "mtproto_domain": "",
+    "images": {
+        "xray": "ghcr.io/xtls/xray-core:26.9.9",
+        "hysteria": "tobyxdd/hysteria:v2.12.3",
+        "caddy": "caddy:2.10",
+        "prometheus": "prom/prometheus:v3.5.0",
+        "alertmanager": "prom/alertmanager:v0.28.1",
+        "blackbox": "prom/blackbox-exporter:v0.27.0",
+        "node_exporter": "prom/node-exporter:v1.9.1",
+        "grafana": "grafana/grafana:12.1.1",
+        "mtg": "nineseconds/mtg:2",
+    },
+}
+
+# rendered path prefix -> compose services to restart when it changes
+RESTART_MAP = {
+    "exit": {
+        "xray/": ["xray"],
+        "geo/": ["xray", "probe-xray"],
+        "hysteria/": ["hysteria"],
+        "caddy/": ["caddy"],
+        "prometheus/": ["prometheus"],
+        "alertmanager/": ["alertmanager"],
+        "blackbox/": ["blackbox"],
+        "grafana/": ["grafana"],
+        "probe/xray": ["probe-xray"],
+        "probe/hy-entry": ["probe-hy-entry"],
+        "probe/hy-exit": ["probe-hy-exit"],
+    },
+    "entry": {
+        "xray/": ["xray"],
+        "geo/": ["xray"],
+        "hysteria/server": ["hysteria"],
+        "hysteria/bridge": ["hy-bridge"],
+        "mtg/": ["mtg"],
+    },
+}
+
+
+# ---------------------------------------------------------------- helpers
+
+def info(msg):
+    print(f"\033[0;32m[+]\033[0m {msg}")
+
+
+def warn(msg):
+    print(f"\033[1;33m[!]\033[0m {msg}")
+
+
+def die(msg):
+    print(f"\033[0;31m[x]\033[0m {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def run(cmd, check=True, capture=False, input_bytes=None):
+    res = subprocess.run(cmd, check=False, capture_output=capture, input=input_bytes)
+    if check and res.returncode != 0:
+        err = res.stderr.decode(errors="replace") if capture and res.stderr else ""
+        die(f"command failed ({res.returncode}): {' '.join(map(str, cmd))}\n{err}")
+    return res
+
+
+def b64(data):
+    if isinstance(data, str):
+        data = data.encode()
+    return base64.b64encode(data).decode()
+
+
+def b64url_raw(data):
+    return base64.urlsafe_b64encode(data).decode().rstrip("=")
+
+
+def x25519_keypair():
+    """Reality keypair via openssl: raw 32-byte keys are the DER tails."""
+    priv_der = run(["openssl", "genpkey", "-algorithm", "X25519", "-outform", "DER"],
+                   capture=True).stdout
+    pub_der = run(["openssl", "pkey", "-inform", "DER", "-pubout", "-outform", "DER"],
+                  capture=True, input_bytes=priv_der).stdout
+    return b64url_raw(priv_der[-32:]), b64url_raw(pub_der[-32:])
+
+
+def password(nbytes=18):
+    return secrets.token_urlsafe(nbytes)
+
+
+def load_json(path, default=None):
+    if not path.exists():
+        return default
+    return json.loads(path.read_text())
+
+
+def save_json(path, data, mode=0o600):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+    os.chmod(tmp, mode)
+    tmp.replace(path)
+
+
+def load_config():
+    cfg = load_json(CONFIG_FILE)
+    if cfg is None:
+        die("state/config.json not found — run: ./styxctl init")
+    merged = json.loads(json.dumps(DEFAULTS))
+    merged.update({k: v for k, v in cfg.items() if k != "images"})
+    merged["images"].update(cfg.get("images", {}))
+    return merged
+
+
+def load_users():
+    return load_json(USERS_FILE, [])
+
+
+def save_users(users):
+    save_json(USERS_FILE, users)
+
+
+def ask(prompt, default=None, required=True):
+    suffix = f" [{default}]" if default not in (None, "") else ""
+    while True:
+        val = input(f"{prompt}{suffix}: ").strip()
+        if not val and default is not None:
+            return default
+        if val or not required:
+            return val
+        print("  значение обязательно")
+
+
+def detect_public_ip():
+    for url in ("https://api.ipify.org", "https://ifconfig.me/ip"):
+        try:
+            with urllib.request.urlopen(url, timeout=5) as r:
+                ip = r.read().decode().strip()
+                if re.fullmatch(r"\d+\.\d+\.\d+\.\d+", ip):
+                    return ip
+        except Exception:
+            pass
+    return None
+
+
+def tpl(text, values):
+    """Replace @@KEY@@ tokens; fail loudly on leftovers."""
+    for k, v in values.items():
+        text = text.replace(f"@@{k}@@", str(v))
+    left = re.findall(r"@@[A-Z0-9_]+@@", text)
+    if left:
+        die(f"unrendered template tokens: {sorted(set(left))}")
+    return text
+
+
+def sanitize_name(name):
+    name = name.strip().lower().replace(" ", "-")
+    if not re.fullmatch(r"[a-z0-9][a-z0-9_.-]{0,31}", name):
+        die("имя: латиница/цифры/._- , до 32 символов (например: ivan, masha-phone)")
+    if name in SYSTEM_USERS:
+        die(f"имя '{name}' зарезервировано")
+    return name
+
+
+# ---------------------------------------------------------------- init
+
+def cmd_init(args):
+    if CONFIG_FILE.exists() and not args.force:
+        die("state/config.json уже существует (используй --force для перегенерации — "
+            "все клиентские ссылки станут недействительными)")
+
+    print("\n=== Styx 2 — первичная настройка (запускать на US/exit ноде) ===\n")
+    cfg = {}
+    cfg["server_name"] = ask("Название VPN (видно в клиентах)", DEFAULTS["server_name"])
+    domain = ask("Базовый домен (например example.com)")
+    cfg["sub_host"] = ask("Хост для подписок и Grafana (A-запись → US IP)", f"sub.{domain}")
+    cfg["hy_host"] = ask("Хост для сертификата Hysteria2 (A-запись → US IP)", f"hy.{domain}")
+    cfg["acme_email"] = ask("Email для Let's Encrypt", f"admin@{domain}")
+    cfg["sub_port"] = int(ask("TCP-порт HTTPS подписок", DEFAULTS["sub_port"]))
+
+    cfg["exit_ip"] = ask("Публичный IPv4 US-ноды (exit)", detect_public_ip())
+    cfg["exit_ssh_port"] = int(ask("SSH-порт US-ноды", DEFAULTS["exit_ssh_port"]))
+    cfg["entry_ip"] = ask("Публичный IPv4 RU-ноды (entry, белый список)")
+    cfg["entry_ssh_port"] = int(ask("SSH-порт RU-ноды", DEFAULTS["entry_ssh_port"]))
+    cfg["entry_ssh_user"] = ask("SSH-пользователь RU-ноды", DEFAULTS["entry_ssh_user"])
+
+    print("\nReality SNI: сайт с TLS 1.3 + H2, лучше в той же подсети/ASN, что и сервер.")
+    print("Подбор: RealiTLScanner по соседним IP (см. deploy/README.md).")
+    cfg["exit_reality_sni"] = ask("Reality SNI для US-ноды (например www.example-neighbour.com)")
+    cfg["entry_reality_sni"] = ask("Reality SNI для RU-ноды (домен ИЗ БЕЛОГО СПИСКА, напр. в той же облачной сети)")
+
+    cfg["hop_range"] = ask("Диапазон UDP port hopping", DEFAULTS["hop_range"])
+    cfg["bridge_port"] = int(ask("TCP-порт межсерверного туннеля XHTTP (открыт только для RU IP)",
+                                 DEFAULTS["bridge_port"]))
+
+    print("\nАлерты в Telegram (бот от @BotFather, chat_id — твой id или id группы).")
+    cfg["telegram_bot_token"] = ask("Telegram bot token")
+    cfg["telegram_chat_id"] = ask("Telegram chat_id")
+    cfg["deadman_url"] = ask("Dead man's switch URL (healthchecks.io, Enter — пропустить)",
+                             "", required=False)
+
+    mt = ask("Включить MTProto-прокси для Telegram на RU-ноде? (y/N)", "n", required=False)
+    cfg["mtproto_enabled"] = mt.lower().startswith("y")
+    if cfg["mtproto_enabled"]:
+        cfg["mtproto_port"] = int(ask("Порт MTProto", DEFAULTS["mtproto_port"]))
+        cfg["mtproto_domain"] = ask("FakeTLS-домен для MTProto (из белого списка)",
+                                    cfg["entry_reality_sni"])
+
+    info("Генерирую ключи и секреты...")
+    exit_priv, exit_pub = x25519_keypair()
+    entry_priv, entry_pub = x25519_keypair()
+    cfg["secrets"] = {
+        "exit_reality_private": exit_priv,
+        "exit_reality_public": exit_pub,
+        "entry_reality_private": entry_priv,
+        "entry_reality_public": entry_pub,
+        "exit_short_id": secrets.token_hex(8),
+        "entry_short_id": secrets.token_hex(8),
+        "bridge_short_id": secrets.token_hex(8),
+        "xhttp_path": "/" + secrets.token_hex(6),
+        "exit_obfs": password(24),
+        "entry_obfs": password(24),
+        "bridge_uuid": str(uuid.uuid4()),
+        "bridge_hy_password": password(),
+        "probe_uuid": str(uuid.uuid4()),
+        "probe_hy_password": password(),
+        "hy_stats_secret": password(),
+        "grafana_password": password(12),
+        "mtproto_secret": "",
+    }
+    if cfg["mtproto_enabled"]:
+        cfg["secrets"]["mtproto_secret"] = mtproto_secret(cfg["mtproto_domain"])
+
+    save_json(CONFIG_FILE, cfg)
+    if not USERS_FILE.exists():
+        save_users([])
+
+    if not SSH_KEY.exists():
+        SSH_KEY.parent.mkdir(parents=True, exist_ok=True)
+        run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", "styx-control", "-f", str(SSH_KEY)])
+    pub = (SSH_KEY.parent / "id_ed25519.pub").read_text().strip()
+
+    info("Готово. state/config.json создан (держи его в секрете и делай бэкап).")
+    print("\nДальше:")
+    print("  1) На RU-ноде добавь ключ управления в /root/.ssh/authorized_keys:\n")
+    print(f"     {pub}\n")
+    print("  2) ./styxctl geo-update")
+    print("  3) ./styxctl user add <имя>")
+    print("  4) ./styxctl deploy")
+    print(f"\nGrafana: https://{cfg['sub_host']}:{cfg['sub_port']}/grafana/  "
+          f"(admin / {cfg['secrets']['grafana_password']})")
+
+
+def mtproto_secret(domain):
+    """FakeTLS secret: ee + 16 random bytes + hex(domain)."""
+    return "ee" + secrets.token_hex(16) + domain.encode().hex()
+
+
+# ---------------------------------------------------------------- users
+
+def find_user(users, name):
+    for u in users:
+        if u["name"] == name:
+            return u
+    die(f"пользователь '{name}' не найден")
+
+
+def cmd_user_add(args):
+    cfg = load_config()
+    users = load_users()
+    name = sanitize_name(args.name)
+    if any(u["name"] == name for u in users):
+        die(f"пользователь '{name}' уже есть")
+    user = {
+        "name": name,
+        "uuid": str(uuid.uuid4()),
+        "hy_password": password(),
+        "token": secrets.token_urlsafe(18),
+        "enabled": True,
+        "note": args.note or "",
+        "created": datetime.date.today().isoformat(),
+    }
+    users.append(user)
+    save_users(users)
+    info(f"пользователь '{name}' создан")
+    if not args.no_deploy:
+        deploy(cfg, users)
+    show_user(cfg, user)
+
+
+def cmd_user_del(args):
+    cfg = load_config()
+    users = load_users()
+    find_user(users, args.name)
+    users = [u for u in users if u["name"] != args.name]
+    save_users(users)
+    info(f"пользователь '{args.name}' удалён")
+    if not args.no_deploy:
+        deploy(cfg, users)
+
+
+def cmd_user_toggle(args, enabled):
+    cfg = load_config()
+    users = load_users()
+    find_user(users, args.name)["enabled"] = enabled
+    save_users(users)
+    info(f"пользователь '{args.name}' {'включён' if enabled else 'отключён'}")
+    if not args.no_deploy:
+        deploy(cfg, users)
+
+
+def cmd_user_rotate(args):
+    """New credentials + new subscription URL (old link stops working)."""
+    cfg = load_config()
+    users = load_users()
+    u = find_user(users, args.name)
+    u["uuid"] = str(uuid.uuid4())
+    u["hy_password"] = password()
+    u["token"] = secrets.token_urlsafe(18)
+    save_users(users)
+    if not args.no_deploy:
+        deploy(cfg, users)
+    show_user(cfg, u)
+
+
+def cmd_user_list(args):
+    users = load_users()
+    if not users:
+        print("пользователей нет")
+        return
+    print(f"{'имя':<20} {'статус':<10} {'создан':<12} заметка")
+    for u in users:
+        st = "активен" if u["enabled"] else "отключён"
+        print(f"{u['name']:<20} {st:<10} {u['created']:<12} {u.get('note', '')}")
+
+
+def cmd_user_show(args):
+    cfg = load_config()
+    show_user(cfg, find_user(load_users(), args.name))
+
+
+def sub_url(cfg, user):
+    return f"https://{cfg['sub_host']}:{cfg['sub_port']}/s/{user['token']}"
+
+
+def show_user(cfg, user):
+    url = sub_url(cfg, user)
+    print("\n" + "=" * 60)
+    print(f"  {user['name']}")
+    print("=" * 60)
+    print(f"\nПодписка (Happ / v2RayTun / Hiddify / Shadowrocket / Throne):\n\n  {url}\n")
+    print(f"Happ одним тапом:  happ://add/{url}")
+    print(f"v2RayTun:          v2raytun://import/{url}\n")
+    if shutil.which("qrencode"):
+        subprocess.run(["qrencode", "-t", "ANSIUTF8", "-m", "1", url])
+    print("Отдельные ссылки:")
+    for line in client_links(cfg, user):
+        print(f"  {line}")
+    print()
+
+
+# ---------------------------------------------------------------- links
+
+def frag(name):
+    return urllib.parse.quote(name, safe="")
+
+
+def vless_link(uid, host, port, pbk, sni, sid, fp, name):
+    q = urllib.parse.urlencode({
+        "type": "tcp", "security": "reality", "encryption": "none",
+        "flow": "xtls-rprx-vision", "fp": fp, "pbk": pbk, "sni": sni, "sid": sid,
+    })
+    return f"vless://{uid}@{host}:{port}?{q}#{frag(name)}"
+
+
+def hy2_link(user, pw, host, sni, obfs, hop, name):
+    auth = urllib.parse.quote(f"{user}:{pw}", safe=":")
+    q = urllib.parse.urlencode({
+        "sni": sni, "obfs": "salamander", "obfs-password": obfs, "mport": hop,
+    })
+    return f"hy2://{auth}@{host}:443?{q}#{frag(name)}"
+
+
+def client_links(cfg, user):
+    s = cfg["secrets"]
+    fp = cfg["fingerprint"]
+    return [
+        vless_link(user["uuid"], cfg["entry_ip"], 443, s["entry_reality_public"],
+                   cfg["entry_reality_sni"], s["entry_short_id"], fp,
+                   "🇷🇺→🇺🇸 RU-вход · VLESS (белые списки)"),
+        hy2_link(user["name"], user["hy_password"], cfg["entry_ip"], cfg["hy_host"],
+                 s["entry_obfs"], cfg["hop_range"], "🇷🇺→🇺🇸 RU-вход · Hysteria2"),
+        vless_link(user["uuid"], cfg["exit_ip"], 443, s["exit_reality_public"],
+                   cfg["exit_reality_sni"], s["exit_short_id"], fp,
+                   "🇺🇸 США напрямую · VLESS"),
+        hy2_link(user["name"], user["hy_password"], cfg["exit_ip"], cfg["hy_host"],
+                 s["exit_obfs"], cfg["hop_range"], "🇺🇸 США напрямую · Hysteria2"),
+    ]
+
+
+# ---------------------------------------------------------------- xray configs
+
+def xray_base(cfg):
+    return {
+        "log": {"loglevel": "warning", "access": "none", "dnsLog": False},
+        "api": {"tag": "api", "listen": "127.0.0.1:10085",
+                "services": ["StatsService", "HandlerService"]},
+        "metrics": {"tag": "metrics", "listen": "127.0.0.1:11111"},
+        "stats": {},
+        "policy": {
+            "levels": {"0": {
+                "handshake": 4, "connIdle": 300, "uplinkOnly": 1, "downlinkOnly": 1,
+                "statsUserUplink": True, "statsUserDownlink": True, "statsUserOnline": True,
+            }},
+            "system": {
+                "statsInboundUplink": True, "statsInboundDownlink": True,
+                "statsOutboundUplink": True, "statsOutboundDownlink": True,
+            },
+        },
+        "dns": {
+            "servers": ["https+local://1.1.1.1/dns-query", "https+local://8.8.8.8/dns-query", "localhost"],
+            "queryStrategy": "UseIPv4",
+        },
+    }
+
+
+def reality_server(sni, private_key, short_ids):
+    return {
+        "show": False,
+        "target": f"{sni}:443",
+        "xver": 0,
+        "serverNames": [sni],
+        "privateKey": private_key,
+        "shortIds": short_ids,
+    }
+
+
+SNIFFING = {"enabled": True, "destOverride": ["http", "tls", "quic"], "routeOnly": True}
+
+
+def vless_clients(users, extra, flow=True):
+    out = []
+    for u in users:
+        if not u["enabled"]:
+            continue
+        c = {"id": u["uuid"], "email": u["name"]}
+        if flow:
+            c["flow"] = "xtls-rprx-vision"
+        out.append(c)
+    for name, uid in extra:
+        c = {"id": uid, "email": name}
+        if flow:
+            c["flow"] = "xtls-rprx-vision"
+        out.append(c)
+    return out
+
+
+def exit_xray(cfg, users):
+    s = cfg["secrets"]
+    conf = xray_base(cfg)
+    conf["inbounds"] = [
+        {
+            "tag": "vless-in", "listen": "0.0.0.0", "port": 443, "protocol": "vless",
+            "settings": {"clients": vless_clients(users, [("probe", s["probe_uuid"]),
+                                                          ("bridge", s["bridge_uuid"])]),
+                         "decryption": "none"},
+            "streamSettings": {
+                "network": "raw", "security": "reality",
+                "realitySettings": reality_server(cfg["exit_reality_sni"], s["exit_reality_private"],
+                                                  [s["exit_short_id"], s["bridge_short_id"]]),
+                "sockopt": {"tcpFastOpen": True},
+            },
+            "sniffing": SNIFFING,
+        },
+        {
+            # RU entry -> US tunnel. Firewalled to the entry IP only.
+            "tag": "bridge-in", "listen": "0.0.0.0", "port": cfg["bridge_port"], "protocol": "vless",
+            "settings": {"clients": [{"id": s["bridge_uuid"], "email": "bridge"}], "decryption": "none"},
+            "streamSettings": {
+                "network": "xhttp", "security": "reality",
+                "xhttpSettings": {"path": s["xhttp_path"], "mode": "auto"},
+                "realitySettings": reality_server(cfg["exit_reality_sni"], s["exit_reality_private"],
+                                                  [s["bridge_short_id"]]),
+            },
+            "sniffing": SNIFFING,
+        },
+    ]
+    conf["outbounds"] = [
+        {"tag": "direct", "protocol": "freedom",
+         "streamSettings": {"sockopt": {"domainStrategy": "UseIPv4v6"}}},
+        {"tag": "block", "protocol": "blackhole"},
+    ]
+    conf["routing"] = {
+        "domainStrategy": "IPIfNonMatch",
+        "rules": [
+            {"type": "field", "protocol": ["bittorrent"], "outboundTag": "block"},
+            {"type": "field", "ip": ["geoip:private"], "outboundTag": "block"},
+            {"type": "field", "domain": ["geosite:category-ads-all"], "outboundTag": "block"},
+        ],
+    }
+    return conf
+
+
+def entry_xray(cfg, users):
+    s = cfg["secrets"]
+    conf = xray_base(cfg)
+    conf["inbounds"] = [
+        {
+            "tag": "vless-in", "listen": "0.0.0.0", "port": 443, "protocol": "vless",
+            "settings": {"clients": vless_clients(users, [("probe", s["probe_uuid"])]),
+                         "decryption": "none"},
+            "streamSettings": {
+                "network": "raw", "security": "reality",
+                "realitySettings": reality_server(cfg["entry_reality_sni"], s["entry_reality_private"],
+                                                  [s["entry_short_id"]]),
+                "sockopt": {"tcpFastOpen": True},
+            },
+            "sniffing": SNIFFING,
+        },
+        {
+            # local hand-off for Hysteria2 server and MTProto: same routing as VLESS
+            "tag": "local-socks", "listen": "127.0.0.1", "port": 10808, "protocol": "socks",
+            "settings": {"auth": "noauth", "udp": True},
+            "sniffing": SNIFFING,
+        },
+    ]
+    bridge_reality = {
+        "serverName": cfg["exit_reality_sni"], "fingerprint": cfg["fingerprint"],
+        "publicKey": s["exit_reality_public"], "shortId": s["bridge_short_id"],
+    }
+    conf["outbounds"] = [
+        {
+            "tag": "us-xhttp", "protocol": "vless",
+            "settings": {"vnext": [{"address": cfg["exit_ip"], "port": cfg["bridge_port"],
+                                    "users": [{"id": s["bridge_uuid"], "encryption": "none"}]}]},
+            "streamSettings": {"network": "xhttp", "security": "reality",
+                               "xhttpSettings": {"path": s["xhttp_path"], "mode": "auto"},
+                               "realitySettings": bridge_reality},
+        },
+        {
+            "tag": "us-vision", "protocol": "vless",
+            "settings": {"vnext": [{"address": cfg["exit_ip"], "port": 443,
+                                    "users": [{"id": s["bridge_uuid"], "encryption": "none",
+                                               "flow": "xtls-rprx-vision"}]}]},
+            "streamSettings": {"network": "raw", "security": "reality",
+                               "realitySettings": bridge_reality},
+        },
+        {
+            # Hysteria2 client container (hy-bridge) exposes SOCKS5 here
+            "tag": "us-hy2", "protocol": "socks",
+            "settings": {"servers": [{"address": "127.0.0.1", "port": 10809}]},
+        },
+        {"tag": "direct", "protocol": "freedom",
+         "streamSettings": {"sockopt": {"domainStrategy": "UseIPv4v6"}}},
+        {"tag": "block", "protocol": "blackhole"},
+    ]
+    conf["burstObservatory"] = {
+        "subjectSelector": ["us-"],
+        "pingConfig": {"destination": "https://www.gstatic.com/generate_204", "connectivity": "",
+                       "interval": "30s", "sampling": 4, "timeout": "6s"},
+    }
+    conf["routing"] = {
+        "domainStrategy": "IPIfNonMatch",
+        "balancers": [{"tag": "us", "selector": ["us-"],
+                       "strategy": {"type": "leastPing"}, "fallbackTag": "us-xhttp"}],
+        "rules": [
+            # monitoring from the exit node: probe user may reach local exporters only
+            {"type": "field", "user": ["probe"], "ip": ["127.0.0.1"], "port": "9100,9550",
+             "outboundTag": "direct"},
+            {"type": "field", "protocol": ["bittorrent"], "outboundTag": "block"},
+            {"type": "field", "ip": ["geoip:private"], "outboundTag": "block"},
+            {"type": "field", "domain": ["geosite:category-ads-all"], "outboundTag": "block"},
+            # blocked in RU -> always via US even if the domain looks Russian
+            {"type": "field", "domain": ["geosite:ru-blocked"], "balancerTag": "us"},
+            {"type": "field", "ip": ["geoip:ru-blocked"], "balancerTag": "us"},
+            # Russian services leave from the Russian IP (banks, gosuslugi, marketplaces)
+            {"type": "field", "domain": ["geosite:category-ru", "geosite:ru-available-only-inside",
+                                         "domain:ru", "domain:su", "domain:xn--p1ai"],
+             "outboundTag": "direct"},
+            {"type": "field", "ip": ["geoip:ru"], "outboundTag": "direct"},
+            {"type": "field", "network": "tcp,udp", "balancerTag": "us"},
+        ],
+    }
+    return conf
+
+
+def probe_xray(cfg):
+    """Client used by blackbox/prometheus on the exit node to test full chains."""
+    s = cfg["secrets"]
+    fp = cfg["fingerprint"]
+
+    def out(tag, host, pbk, sni, sid):
+        return {
+            "tag": tag, "protocol": "vless",
+            "settings": {"vnext": [{"address": host, "port": 443,
+                                    "users": [{"id": s["probe_uuid"], "encryption": "none",
+                                               "flow": "xtls-rprx-vision"}]}]},
+            "streamSettings": {"network": "raw", "security": "reality",
+                               "realitySettings": {"serverName": sni, "fingerprint": fp,
+                                                   "publicKey": pbk, "shortId": sid}},
+        }
+
+    return {
+        "log": {"loglevel": "warning"},
+        "inbounds": [
+            {"tag": "via-entry", "listen": "127.0.0.1", "port": 18081, "protocol": "http"},
+            {"tag": "via-exit", "listen": "127.0.0.1", "port": 18082, "protocol": "http"},
+        ],
+        "outbounds": [
+            out("entry", cfg["entry_ip"], s["entry_reality_public"], cfg["entry_reality_sni"],
+                s["entry_short_id"]),
+            out("exit", cfg["exit_ip"], s["exit_reality_public"], cfg["exit_reality_sni"],
+                s["exit_short_id"]),
+        ],
+        "routing": {"rules": [
+            {"type": "field", "inboundTag": ["via-entry"], "outboundTag": "entry"},
+            {"type": "field", "inboundTag": ["via-exit"], "outboundTag": "exit"},
+        ]},
+    }
+
+
+# ---------------------------------------------------------------- hysteria configs
+
+def hy_bandwidth(cfg):
+    bw = {}
+    if cfg["hy_bandwidth_up"]:
+        bw["up"] = cfg["hy_bandwidth_up"]
+    if cfg["hy_bandwidth_down"]:
+        bw["down"] = cfg["hy_bandwidth_down"]
+    return bw
+
+
+PRIVATE_ACL = [
+    "reject(0.0.0.0/8)", "reject(10.0.0.0/8)", "reject(100.64.0.0/10)", "reject(127.0.0.0/8)",
+    "reject(169.254.0.0/16)", "reject(172.16.0.0/12)", "reject(192.168.0.0/16)",
+    "reject(::1/128)", "reject(fc00::/7)", "reject(fe80::/10)",
+]
+
+
+def hy_server(cfg, users, obfs, extra_users, cert, key, socks_outbound):
+    userpass = {u["name"]: u["hy_password"] for u in users if u["enabled"]}
+    userpass.update(extra_users)
+    conf = {
+        "listen": ":443",
+        "tls": {"cert": cert, "key": key, "sniGuard": "disable"},
+        "obfs": {"type": "salamander", "salamander": {"password": obfs}},
+        "auth": {"type": "userpass", "userpass": userpass},
+        "quic": {
+            "initStreamReceiveWindow": 8388608, "maxStreamReceiveWindow": 8388608,
+            "initConnReceiveWindow": 20971520, "maxConnReceiveWindow": 20971520,
+            "maxIdleTimeout": "60s", "maxIncomingStreams": 1024,
+        },
+        "udpIdleTimeout": "60s",
+        "sniff": {"enable": True, "timeout": "2s", "rewriteDomain": False},
+        "trafficStats": {"listen": "127.0.0.1:9998", "secret": cfg["secrets"]["hy_stats_secret"]},
+    }
+    bw = hy_bandwidth(cfg)
+    if bw:
+        conf["bandwidth"] = bw
+    if socks_outbound:
+        # everything goes to local Xray, which applies the RU-direct / US-balancer routing
+        conf["outbounds"] = [{"name": "xray", "type": "socks5",
+                              "socks5": {"addr": "127.0.0.1:10808"}}]
+    else:
+        conf["outbounds"] = [{"name": "direct", "type": "direct", "direct": {"mode": "auto"}}]
+        conf["acl"] = {"inline": PRIVATE_ACL + ["direct(all)"]}
+    return conf
+
+
+def hy_client(cfg, server, auth, obfs, listen_key, listen_addr):
+    return {
+        "server": server,
+        "auth": auth,
+        "tls": {"sni": cfg["hy_host"]},
+        "obfs": {"type": "salamander", "salamander": {"password": obfs}},
+        "transport": {"udp": {"minHopInterval": "20s", "maxHopInterval": "50s"}},
+        "fastOpen": True,
+        "lazy": False,
+        listen_key: {"listen": listen_addr},
+    }
+
+
+def caddy_cert_paths(host):
+    base = f"/caddy/data/caddy/certificates/acme-v02.api.letsencrypt.org-directory/{host}"
+    return f"{base}/{host}.crt", f"{base}/{host}.key"
+
+
+# ---------------------------------------------------------------- render
+
+def read_routing(name):
+    return (ROOT / "routing" / name).read_text()
+
+
+def render_subscriptions(cfg, users, out_dir):
+    happ_routing = b64(read_routing("happ.json"))
+    for u in users:
+        if not u["enabled"]:
+            continue
+        links = "\n".join(client_links(cfg, u))
+        (out_dir / f"{u['token']}.txt").write_text(b64(links))
+        (out_dir / f"{u['token']}.happ").write_text(
+            b64(f"happ://routing/onadd/{happ_routing}\n{links}"))
+    (out_dir / "index.html").write_text("")
+
+
+def write(path, content, mode=0o644):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if isinstance(content, (dict, list)):
+        content = json.dumps(content, indent=2, ensure_ascii=False) + "\n"
+    path.write_text(content)
+    os.chmod(path, mode)
+
+
+def copy_tree(src, dst):
+    shutil.copytree(src, dst, dirs_exist_ok=True,
+                    ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+
+
+def tpl_values(cfg):
+    s = cfg["secrets"]
+    hop_start, hop_end = cfg["hop_range"].split("-")
+    im = cfg["images"]
+    return {
+        "SERVER_NAME": cfg["server_name"],
+        "SERVER_NAME_B64": b64(cfg["server_name"]),
+        "SUB_HOST": cfg["sub_host"], "HY_HOST": cfg["hy_host"], "SUB_PORT": cfg["sub_port"],
+        "ACME_EMAIL": cfg["acme_email"],
+        "EXIT_IP": cfg["exit_ip"], "ENTRY_IP": cfg["entry_ip"],
+        "EXIT_SSH_PORT": cfg["exit_ssh_port"], "ENTRY_SSH_PORT": cfg["entry_ssh_port"],
+        "BRIDGE_PORT": cfg["bridge_port"],
+        "HOP_START": hop_start, "HOP_END": hop_end,
+        "TELEGRAM_BOT_TOKEN": cfg["telegram_bot_token"],
+        "TELEGRAM_CHAT_ID": cfg["telegram_chat_id"],
+        "DEADMAN_BLOCK": (f'    webhook_configs:\n      - url: "{cfg["deadman_url"]}"\n        send_resolved: false'
+                          if cfg["deadman_url"] else "    # dead man's switch disabled (deadman_url is empty)"),
+        "V2RAYTUN_ROUTING_B64": b64(read_routing("v2raytun.json")),
+        "GRAFANA_PASSWORD": s["grafana_password"],
+        "HY_STATS_SECRET": s["hy_stats_secret"],
+        "MTPROTO_PORT": cfg["mtproto_port"],
+        "MTPROTO_SECRET": s.get("mtproto_secret", ""),
+        "IMG_XRAY": im["xray"], "IMG_HYSTERIA": im["hysteria"], "IMG_CADDY": im["caddy"],
+        "IMG_PROMETHEUS": im["prometheus"], "IMG_ALERTMANAGER": im["alertmanager"],
+        "IMG_BLACKBOX": im["blackbox"], "IMG_NODE_EXPORTER": im["node_exporter"],
+        "IMG_GRAFANA": im["grafana"], "IMG_MTG": im["mtg"],
+    }
+
+
+def render_templates(src_dir, dst_dir, values):
+    """Copy a node template dir; files ending in .tpl are rendered and lose the suffix."""
+    for src in sorted(src_dir.rglob("*")):
+        if src.is_dir():
+            continue
+        rel = src.relative_to(src_dir)
+        if src.suffix == ".tpl":
+            write(dst_dir / str(rel)[:-4], tpl(src.read_text(), values))
+        else:
+            (dst_dir / rel).parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, dst_dir / rel)
+
+
+def render_host(dst, role, values):
+    write(dst / "sysctl.conf", (ROOT / "host" / "sysctl.conf").read_text())
+    write(dst / "nftables.nft", tpl((ROOT / "host" / f"{role}.nft.tpl").read_text(), values))
+
+
+def render(cfg, users):
+    """Render both nodes into a fresh temp dir and return it."""
+    tmp = Path(tempfile.mkdtemp(prefix="styx-build-", dir=STATE))
+    values = tpl_values(cfg)
+    s = cfg["secrets"]
+
+    # ---- exit
+    ex = tmp / "exit"
+    render_templates(ROOT / "exit", ex, values)
+    render_host(ex / "host", "exit", values)
+    copy_tree(ROOT / "exporter", ex / "exporter")
+    write(ex / "xray" / "config.json", exit_xray(cfg, users))
+    cert, key = caddy_cert_paths(cfg["hy_host"])
+    write(ex / "hysteria" / "config.json",
+          hy_server(cfg, users, s["exit_obfs"],
+                    {"probe": s["probe_hy_password"], "bridge": s["bridge_hy_password"]},
+                    cert, key, socks_outbound=False), 0o600)
+    write(ex / "probe" / "xray.json", probe_xray(cfg))
+    write(ex / "probe" / "hy-entry.json",
+          hy_client(cfg, f"{cfg['entry_ip']}:443", f"probe:{s['probe_hy_password']}",
+                    s["entry_obfs"], "http", "127.0.0.1:18083"), 0o600)
+    write(ex / "probe" / "hy-exit.json",
+          hy_client(cfg, f"{cfg['exit_ip']}:443", f"probe:{s['probe_hy_password']}",
+                    s["exit_obfs"], "http", "127.0.0.1:18084"), 0o600)
+    (ex / "sub").mkdir(parents=True, exist_ok=True)
+    render_subscriptions(cfg, users, ex / "sub")
+    copy_geo(ex / "geo")
+
+    # ---- entry
+    en = tmp / "entry"
+    render_templates(ROOT / "entry", en, values)
+    render_host(en / "host", "entry", dict(values, MTPROTO_RULE=(
+        f"tcp dport {cfg['mtproto_port']} accept comment \"mtproto\"" if cfg["mtproto_enabled"] else "")))
+    copy_tree(ROOT / "exporter", en / "exporter")
+    write(en / "xray" / "config.json", entry_xray(cfg, users))
+    write(en / "hysteria" / "server.json",
+          hy_server(cfg, users, s["entry_obfs"], {"probe": s["probe_hy_password"]},
+                    "/etc/hysteria/tls/cert.crt", "/etc/hysteria/tls/cert.key",
+                    socks_outbound=True), 0o600)
+    write(en / "hysteria" / "bridge.json",
+          hy_client(cfg, f"{cfg['exit_ip']}:{cfg['hop_range']}", f"bridge:{s['bridge_hy_password']}",
+                    s["exit_obfs"], "socks5", "127.0.0.1:10809"), 0o600)
+    copy_geo(en / "geo")
+    if not cfg["mtproto_enabled"]:
+        shutil.rmtree(en / "mtg", ignore_errors=True)
+    return tmp
+
+
+def copy_geo(dst):
+    dst.mkdir(parents=True, exist_ok=True)
+    for name in GEO_URLS:
+        src = GEO_DIR / name
+        if not src.exists():
+            die(f"нет {src} — запусти ./styxctl geo-update")
+        shutil.copy2(src, dst / name)
+
+
+def tree_hashes(root):
+    out = {}
+    if not root.exists():
+        return out
+    for p in sorted(root.rglob("*")):
+        if p.is_file():
+            out[str(p.relative_to(root))] = hashlib.sha256(p.read_bytes()).hexdigest()
+    return out
+
+
+def changed_services(node, old, new):
+    changed = {f for f in set(old) | set(new) if old.get(f) != new.get(f)}
+    services = set()
+    for f in changed:
+        for prefix, svcs in RESTART_MAP[node].items():
+            if f.startswith(prefix):
+                services.update(svcs)
+    return changed, services
+
+
+def cmd_render(args):
+    cfg = load_config()
+    tmp = render(cfg, load_users())
+    for node in ("exit", "entry"):
+        dst = BUILD / node
+        shutil.rmtree(dst, ignore_errors=True)
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(tmp / node), dst)
+    shutil.rmtree(tmp, ignore_errors=True)
+    info(f"конфиги отрендерены в {BUILD}")
+
+
+# ---------------------------------------------------------------- deploy
+
+def compose(node_dir, *args):
+    return run(["docker", "compose", "--project-directory", str(node_dir), *args])
+
+
+def ssh_base(cfg):
+    return ["ssh", "-i", str(SSH_KEY), "-p", str(cfg["entry_ssh_port"]),
+            "-o", "StrictHostKeyChecking=accept-new", "-o", "ConnectTimeout=15",
+            "-o", "ServerAliveInterval=10",
+            f"{cfg['entry_ssh_user']}@{cfg['entry_ip']}"]
+
+
+def ssh_run(cfg, remote_cmd, check=True):
+    return run(ssh_base(cfg) + [remote_cmd], check=check)
+
+
+def xray_test(cfg, conf_path, geo_dir):
+    res = run(["docker", "run", "--rm", "--user", "0:0",
+               "-v", f"{conf_path}:/etc/xray/config.json:ro",
+               "-v", f"{geo_dir}:/usr/local/share/xray:ro",
+               cfg["images"]["xray"], "run", "-test", "-config", "/etc/xray/config.json"],
+              check=False, capture=True)
+    if res.returncode != 0:
+        die(f"xray -test не прошёл для {conf_path}:\n{res.stdout.decode()}{res.stderr.decode()}")
+
+
+def apply_host_local(node_dir):
+    run(["install", "-m", "644", str(node_dir / "host" / "sysctl.conf"), "/etc/sysctl.d/99-styx.conf"])
+    run(["sysctl", "-q", "--system"], check=False, capture=True)
+    run(["nft", "-c", "-f", str(node_dir / "host" / "nftables.nft")])
+    run(["install", "-D", "-m", "644", str(node_dir / "host" / "nftables.nft"), "/etc/nftables.d/styx.nft"])
+    run(["nft", "-f", "/etc/nftables.d/styx.nft"])
+
+
+def remote_host_apply_cmd():
+    d = ENTRY_REMOTE_DIR
+    return (f"install -m 644 {d}/host/sysctl.conf /etc/sysctl.d/99-styx.conf && "
+            f"(sysctl -q --system >/dev/null 2>&1 || true) && "
+            f"nft -c -f {d}/host/nftables.nft && "
+            f"install -D -m 644 {d}/host/nftables.nft /etc/nftables.d/styx.nft && "
+            f"nft -f /etc/nftables.d/styx.nft")
+
+
+def wait_for_cert(cfg, timeout=180):
+    cert, key = caddy_cert_paths(cfg["hy_host"])
+    host_cert = CADDY_DATA / cert.removeprefix("/caddy/")
+    host_key = CADDY_DATA / key.removeprefix("/caddy/")
+    import time
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if host_cert.exists() and host_key.exists():
+            return host_cert, host_key
+        time.sleep(5)
+    return None, None
+
+
+def manifest_path(node):
+    return STATE / f"deployed-{node}.json"
+
+
+def deploy(cfg, users, only=None):
+    if os.geteuid() != 0:
+        die("deploy нужно запускать от root (sudo ./styxctl deploy)")
+    tmp = render(cfg, users)
+    try:
+        xray_test(cfg, tmp / "exit" / "xray" / "config.json", tmp / "exit" / "geo")
+        xray_test(cfg, tmp / "entry" / "xray" / "config.json", tmp / "entry" / "geo")
+        xray_test(cfg, tmp / "exit" / "probe" / "xray.json", tmp / "exit" / "geo")
+        info("xray -test: все конфиги валидны")
+
+        for node in ("exit", "entry"):
+            new_hashes = tree_hashes(tmp / node)
+            old_hashes = load_json(manifest_path(node), {})
+            dst = BUILD / node
+            shutil.rmtree(dst, ignore_errors=True)
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(tmp / node), dst)
+            if only and node != only:
+                continue
+            changed, services = changed_services(node, old_hashes, new_hashes)
+            if node == "exit":
+                deploy_exit(cfg, dst, changed, services)
+            else:
+                deploy_entry(cfg, dst, changed, services)
+            save_json(manifest_path(node), new_hashes)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    info("деплой завершён")
+
+
+def deploy_exit(cfg, node_dir, changed, services):
+    info(f"US/exit: изменено файлов: {len(changed)}")
+    if any(f.startswith("host/") for f in changed):
+        apply_host_local(node_dir)
+        info("US/exit: sysctl и firewall применены")
+    CADDY_DATA.mkdir(parents=True, exist_ok=True)
+    compose(node_dir, "up", "-d", "--build", "--remove-orphans")
+    if services:
+        compose(node_dir, "restart", *sorted(services))
+        info(f"US/exit: перезапущены: {', '.join(sorted(services))}")
+
+
+def deploy_entry(cfg, node_dir, changed, services):
+    info(f"RU/entry: изменено файлов: {len(changed)}")
+    cert, key = wait_for_cert(cfg)
+    if cert:
+        tls = node_dir / "hysteria" / "tls"
+        tls.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(cert, tls / "cert.crt")
+        shutil.copy2(key, tls / "cert.key")
+        os.chmod(tls / "cert.key", 0o600)
+    else:
+        warn("сертификат hy-хоста ещё не выпущен Caddy — Hysteria2 на RU-ноде не стартует. "
+             "Проверь DNS-записи и запусти ./styxctl deploy ещё раз")
+    ssh_run(cfg, f"mkdir -p {ENTRY_REMOTE_DIR}")
+    run(["rsync", "-az", "--delete", "-e", " ".join(ssh_base(cfg)[:-1]),
+         f"{node_dir}/", f"{cfg['entry_ssh_user']}@{cfg['entry_ip']}:{ENTRY_REMOTE_DIR}/"])
+    if any(f.startswith("host/") for f in changed):
+        ssh_run(cfg, remote_host_apply_cmd())
+        info("RU/entry: sysctl и firewall применены")
+    profiles = "--profile mtproto " if cfg["mtproto_enabled"] else ""
+    ssh_run(cfg, f"cd {ENTRY_REMOTE_DIR} && docker compose {profiles}up -d --build --remove-orphans")
+    if services:
+        ssh_run(cfg, f"cd {ENTRY_REMOTE_DIR} && docker compose {profiles}restart {' '.join(sorted(services))}")
+        info(f"RU/entry: перезапущены: {', '.join(sorted(services))}")
+
+
+def cmd_deploy(args):
+    deploy(load_config(), load_users(), only=args.only)
+
+
+def cmd_sync_certs(args):
+    """Copy the renewed hy-host certificate to the entry node (Hysteria re-reads it per handshake)."""
+    cfg = load_config()
+    cert, key = wait_for_cert(cfg, timeout=1)
+    if not cert:
+        die("сертификат не найден в state/caddy")
+    tls = BUILD / "entry" / "hysteria" / "tls"
+    if (tls / "cert.crt").exists() and (tls / "cert.crt").read_bytes() == cert.read_bytes():
+        info("сертификат не изменился")
+        return
+    tls.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(cert, tls / "cert.crt")
+    shutil.copy2(key, tls / "cert.key")
+    run(["rsync", "-az", "-e", " ".join(ssh_base(cfg)[:-1]), f"{tls}/",
+         f"{cfg['entry_ssh_user']}@{cfg['entry_ip']}:{ENTRY_REMOTE_DIR}/hysteria/tls/"])
+    info("сертификат обновлён на RU-ноде")
+
+
+def cmd_geo_update(args):
+    GEO_DIR.mkdir(parents=True, exist_ok=True)
+    for name, url in GEO_URLS.items():
+        info(f"скачиваю {name}")
+        tmp = GEO_DIR / f"{name}.tmp"
+        with urllib.request.urlopen(url, timeout=60) as r:
+            tmp.write_bytes(r.read())
+        if tmp.stat().st_size < 100_000:
+            die(f"{name}: подозрительно маленький файл, не обновляю")
+        tmp.replace(GEO_DIR / name)
+    if args.deploy:
+        deploy(load_config(), load_users())
+
+
+# ---------------------------------------------------------------- mtproto
+
+def mtproto_link(cfg):
+    return (f"tg://proxy?server={cfg['entry_ip']}&port={cfg['mtproto_port']}"
+            f"&secret={cfg['secrets']['mtproto_secret']}")
+
+
+def cmd_mtproto(args):
+    raw = load_json(CONFIG_FILE)
+    if raw is None:
+        die("state/config.json not found — run: ./styxctl init")
+    if args.action == "enable":
+        domain = args.domain or raw.get("mtproto_domain") or raw["entry_reality_sni"]
+        raw["mtproto_enabled"] = True
+        raw["mtproto_domain"] = domain
+        raw.setdefault("mtproto_port", args.port or DEFAULTS["mtproto_port"])
+        if args.port:
+            raw["mtproto_port"] = args.port
+        if not raw["secrets"].get("mtproto_secret") or args.domain:
+            raw["secrets"]["mtproto_secret"] = mtproto_secret(domain)
+        save_json(CONFIG_FILE, raw)
+        info(f"MTProto включён (FakeTLS: {domain})")
+    elif args.action == "disable":
+        raw["mtproto_enabled"] = False
+        save_json(CONFIG_FILE, raw)
+        info("MTProto выключен")
+    cfg = load_config()
+    if args.action != "show" and not args.no_deploy:
+        deploy(cfg, load_users())
+        if args.action == "disable":
+            ssh_run(cfg, "docker rm -f styx-mtg >/dev/null 2>&1 || true", check=False)
+    if cfg["mtproto_enabled"]:
+        print(f"\nСсылка для Telegram:\n\n  {mtproto_link(cfg)}\n")
+
+
+# ---------------------------------------------------------------- status
+
+def prom_query(q):
+    url = "http://127.0.0.1:9090/api/v1/query?" + urllib.parse.urlencode({"query": q})
+    with urllib.request.urlopen(url, timeout=10) as r:
+        return json.loads(r.read())["data"]["result"]
+
+
+def human(n):
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024:
+            return f"{n:.1f} {unit}"
+        n /= 1024
+    return f"{n:.1f} PB"
+
+
+def cmd_status(args):
+    users = load_users()
+    try:
+        online = prom_query('styx_user_online{user!~"probe|bridge"}')
+        traffic = prom_query('sum by (user) (increase(styx_user_traffic_bytes_total'
+                             '{user!~"probe|bridge"}[24h]))')
+        probes = prom_query('probe_success{job="chain"}')
+        links = prom_query('styx_outbound_alive')
+        delays = prom_query('styx_outbound_delay_ms')
+    except Exception as e:
+        die(f"Prometheus недоступен на 127.0.0.1:9090: {e}")
+
+    cols = [("entry", "vless"), ("entry", "hy2"), ("exit", "vless"), ("exit", "hy2")]
+    table = {u["name"]: {c: 0 for c in cols} for u in users}
+    for r in online:
+        m = r["metric"]
+        table.setdefault(m["user"], {c: 0 for c in cols})[(m["node"], m["proto"])] = int(float(r["value"][1]))
+    tr = {r["metric"]["user"]: float(r["value"][1]) for r in traffic}
+
+    print("\nУстройства онлайн (VLESS = уникальные IP, HY2 = клиенты):\n")
+    print(f"{'пользователь':<20} {'RU·VLESS':>9} {'RU·HY2':>8} {'US·VLESS':>9} {'US·HY2':>8} {'24ч':>11}")
+    total = 0
+    for name in sorted(table):
+        row = table[name]
+        s = sum(row.values())
+        total += s
+        mark = "●" if s else " "
+        print(f"{mark} {name:<18} " + " ".join(f"{row[c]:>{w}}" for c, w in zip(cols, (9, 8, 9, 8)))
+              + f" {human(tr.get(name, 0)):>11}")
+    active = sum(1 for r in table.values() if sum(r.values()))
+    print(f"\nактивных пользователей: {active} / {len(users)}, устройств: {total}")
+
+    print("\nЦепочки (проверка с US-ноды):")
+    for r in sorted(probes, key=lambda r: r["metric"].get("path", "")):
+        ok = r["value"][1] == "1"
+        print(f"  {'✅' if ok else '❌'} {r['metric'].get('path', r['metric'].get('instance'))}")
+    print("\nКаналы RU → US (observatory на RU-ноде):")
+    dl = {r["metric"]["tag"]: float(r["value"][1]) for r in delays}
+    for r in sorted(links, key=lambda r: r["metric"]["tag"]):
+        tag = r["metric"]["tag"]
+        ok = r["value"][1] == "1"
+        print(f"  {'✅' if ok else '❌'} {tag:<10} {dl.get(tag, 0):.0f} ms")
+    print()
+
+
+# ---------------------------------------------------------------- main
+
+def main():
+    p = argparse.ArgumentParser(prog="styxctl", description="Styx 2 control tool")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    sp = sub.add_parser("init", help="первичная настройка и генерация секретов")
+    sp.add_argument("--force", action="store_true")
+    sp.set_defaults(func=cmd_init)
+
+    up = sub.add_parser("user", help="управление клиентами")
+    usub = up.add_subparsers(dest="ucmd", required=True)
+    a = usub.add_parser("add", help="добавить клиента")
+    a.add_argument("name")
+    a.add_argument("--note", default="")
+    a.add_argument("--no-deploy", action="store_true")
+    a.set_defaults(func=cmd_user_add)
+    for name, fn, hlp in (("del", cmd_user_del, "удалить клиента"),
+                          ("disable", lambda x: cmd_user_toggle(x, False), "временно отключить"),
+                          ("enable", lambda x: cmd_user_toggle(x, True), "включить обратно"),
+                          ("rotate", cmd_user_rotate, "перевыпустить ключи и ссылку")):
+        x = usub.add_parser(name, help=hlp)
+        x.add_argument("name")
+        x.add_argument("--no-deploy", action="store_true")
+        x.set_defaults(func=fn)
+    x = usub.add_parser("show", help="показать ссылки и QR")
+    x.add_argument("name")
+    x.set_defaults(func=cmd_user_show)
+    x = usub.add_parser("list", help="список клиентов")
+    x.set_defaults(func=cmd_user_list)
+
+    sp = sub.add_parser("mtproto", help="MTProto-прокси для Telegram на RU-ноде")
+    sp.add_argument("action", choices=["enable", "disable", "show"])
+    sp.add_argument("--domain", help="FakeTLS-домен (из белого списка)")
+    sp.add_argument("--port", type=int)
+    sp.add_argument("--no-deploy", action="store_true")
+    sp.set_defaults(func=cmd_mtproto)
+
+    sp = sub.add_parser("render", help="только отрендерить конфиги в build/")
+    sp.set_defaults(func=cmd_render)
+    sp = sub.add_parser("deploy", help="отрендерить и задеплоить на обе ноды")
+    sp.add_argument("--only", choices=["exit", "entry"])
+    sp.set_defaults(func=cmd_deploy)
+    sp = sub.add_parser("status", help="кто онлайн, состояние цепочек")
+    sp.set_defaults(func=cmd_status)
+    sp = sub.add_parser("geo-update", help="обновить geoip/geosite (runetfreedom)")
+    sp.add_argument("--deploy", action="store_true")
+    sp.set_defaults(func=cmd_geo_update)
+    sp = sub.add_parser("sync-certs", help="скопировать обновлённый TLS-сертификат на RU-ноду")
+    sp.set_defaults(func=cmd_sync_certs)
+
+    args = p.parse_args()
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()

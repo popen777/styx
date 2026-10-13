@@ -1,0 +1,48 @@
+# Styx 2 — blackbox modules. via_* go through local probe clients (styx-probe-*).
+modules:
+  tcp:
+    prober: tcp
+    timeout: 5s
+    tcp: { preferred_ip_protocol: ip4 }
+
+  https:
+    prober: http
+    timeout: 10s
+    http:
+      preferred_ip_protocol: ip4
+      valid_status_codes: [200]
+      fail_if_not_ssl: true
+
+  via_entry_vless:
+    prober: http
+    timeout: 15s
+    http: &via204
+      preferred_ip_protocol: ip4
+      valid_status_codes: [204]
+      proxy_url: http://127.0.0.1:18081
+  via_exit_vless:
+    prober: http
+    timeout: 15s
+    http:
+      <<: *via204
+      proxy_url: http://127.0.0.1:18082
+  via_entry_hy2:
+    prober: http
+    timeout: 15s
+    http:
+      <<: *via204
+      proxy_url: http://127.0.0.1:18083
+  via_exit_hy2:
+    prober: http
+    timeout: 15s
+    http:
+      <<: *via204
+      proxy_url: http://127.0.0.1:18084
+  via_entry_vless_ru:
+    prober: http
+    timeout: 15s
+    http:
+      preferred_ip_protocol: ip4
+      valid_status_codes: [200, 301, 302]
+      follow_redirects: false
+      proxy_url: http://127.0.0.1:18081

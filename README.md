@@ -1,5 +1,7 @@
 # Styx
 
+> **Styx 2** (RU-вход из белого списка → США, Hysteria2 + Salamander, персональные подписки, мониторинг цепочек) — в [`deploy/`](deploy/README.md).
+
 Personal VPN service with dual protocols and full monitoring, logging, and alerting.
 
 - **VLESS + Reality** (XRay) -- TCP:443, maximum stealth when UDP is blocked

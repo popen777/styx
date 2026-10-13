@@ -1,0 +1,37 @@
+{
+  "Name": "Styx",
+  "GlobalProxy": "true",
+  "RemoteDNSType": "DoH",
+  "RemoteDNSDomain": "https://1.1.1.1/dns-query",
+  "RemoteDNSIP": "1.1.1.1",
+  "DomesticDNSType": "DoH",
+  "DomesticDNSDomain": "https://77.88.8.8/dns-query",
+  "DomesticDNSIP": "77.88.8.8",
+  "RouteOrder": "block-proxy-direct",
+  "DirectSites": [
+    "geosite:private",
+    "geosite:category-ru",
+    "geosite:ru-available-only-inside",
+    "domain:ru",
+    "domain:su",
+    "domain:xn--p1ai"
+  ],
+  "DirectIp": [
+    "geoip:private",
+    "geoip:ru"
+  ],
+  "ProxySites": [
+    "geosite:ru-blocked"
+  ],
+  "ProxyIp": [
+    "geoip:ru-blocked"
+  ],
+  "BlockSites": [
+    "geosite:category-ads-all"
+  ],
+  "BlockIp": [],
+  "DomainStrategy": "IPIfNonMatch",
+  "FakeDNS": "false",
+  "Geoipurl": "https://raw.githubusercontent.com/runetfreedom/russia-v2ray-rules-dat/release/geoip.dat",
+  "Geositeurl": "https://raw.githubusercontent.com/runetfreedom/russia-v2ray-rules-dat/release/geosite.dat"
+}
